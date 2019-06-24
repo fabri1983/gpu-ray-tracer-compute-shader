@@ -1,9 +1,11 @@
 ﻿using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using UnityEngine;
 
 public class RayTracingMaster : MonoBehaviour
 {
+    public UnityEngine.UI.Text m_UIPerfText;
     public ComputeShader RayTracingShader;
     public Texture SkyboxTexture;
     public Light DirectionalLight;
@@ -30,6 +32,11 @@ public class RayTracingMaster : MonoBehaviour
     private ComputeBuffer _meshObjectBuffer;
     private ComputeBuffer _vertexBuffer;
     private ComputeBuffer _indexBuffer;
+
+    private Stopwatch m_Stopwatch = new Stopwatch();
+    private int m_UpdateCounter;
+    private int m_FrameCounter;
+    private long m_RayCounter;
 
     struct MeshObject
     {
@@ -72,6 +79,18 @@ public class RayTracingMaster : MonoBehaviour
 
     private void Update()
     {
+        if (m_UpdateCounter == 1)
+        {
+            var s = (float)((double)m_Stopwatch.ElapsedTicks / (double)Stopwatch.Frequency) / m_UpdateCounter;
+            var ms = s * 1000.0f;
+            var mrayS = m_RayCounter / m_UpdateCounter / s * 1.0e-6f;
+            var mrayFr = m_RayCounter / m_UpdateCounter * 1.0e-6f;
+            m_UIPerfText.text = string.Format("{0:F2}ms ({1:F2}FPS) {2:F2}Mrays/s {3:F2}Mrays/frame {4} frames", ms, 1.0f / s, mrayS, mrayFr, m_FrameCounter);
+            m_UpdateCounter = 0;
+            m_RayCounter = 0;
+            m_Stopwatch.Reset();
+        }
+
         if (Input.GetKeyDown(KeyCode.F12))
         {
             ScreenCapture.CaptureScreenshot(Time.time + "-" + _currentSample + ".png");
@@ -283,15 +302,19 @@ public class RayTracingMaster : MonoBehaviour
         }
     }
 
-    private void Render(RenderTexture destination)
+    private void Render(RenderTexture destination, out int outRayCount)
     {
         // Make sure we have a current render target
         InitRenderTexture();
 
+        var rayCountBuffer = new ComputeBuffer(1, sizeof(int));
+        
         // Set the target and dispatch the compute shader
         RayTracingShader.SetTexture(0, "Result", _target);
+        RayTracingShader.SetBuffer(0, "g_OutRayCount", rayCountBuffer);
         int threadGroupsX = Mathf.CeilToInt(Screen.width / 8.0f);
         int threadGroupsY = Mathf.CeilToInt(Screen.height / 8.0f);
+        m_FrameCounter++;
         RayTracingShader.Dispatch(0, threadGroupsX, threadGroupsY, 1);
 
         // Blit the result texture to the screen
@@ -301,12 +324,24 @@ public class RayTracingMaster : MonoBehaviour
         Graphics.Blit(_target, _converged, _addMaterial);
         Graphics.Blit(_converged, destination);
         _currentSample++;
+
+        var result = new int[1];
+        rayCountBuffer.GetData(result);
+        outRayCount = result[0];
+        rayCountBuffer.Release();
     }
 
     private void OnRenderImage(RenderTexture source, RenderTexture destination)
     {
+        m_Stopwatch.Start();
+        int rayCount = 0;
+
         RebuildMeshObjectBuffers();
         SetShaderParameters();
-        Render(destination);
+        Render(destination, out rayCount);
+
+        m_Stopwatch.Stop();
+        ++m_UpdateCounter;
+        m_RayCounter += rayCount;
     }
 }

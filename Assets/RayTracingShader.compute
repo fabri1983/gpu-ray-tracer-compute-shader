@@ -1,6 +1,10 @@
 ﻿#pragma kernel CSMain
 
+#include "Config.h"
+
 RWTexture2D<float4> Result;
+
+RWByteAddressBuffer g_OutRayCount;
 
 float4x4 _CameraToWorld;
 float4x4 _CameraInverseProjection;
@@ -154,7 +158,7 @@ void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
     }
 }
 
-void IntersectSphere(Ray ray, inout RayHit bestHit, Sphere sphere)
+void IntersectSphere(Ray ray, inout int inoutRayCount, inout RayHit bestHit, Sphere sphere)
 {
     // Calculate distance along the ray where the sphere is intersected
     float3 d = ray.origin - sphere.position;
@@ -164,6 +168,9 @@ void IntersectSphere(Ray ray, inout RayHit bestHit, Sphere sphere)
         return;
     float p2 = sqrt(p2sqr);
     float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+
+	++inoutRayCount;
+
     if (t > 0 && t < bestHit.distance)
     {
         bestHit.distance = t;
@@ -216,10 +223,13 @@ bool IntersectTriangle_MT97(Ray ray, float3 vert0, float3 vert1, float3 vert2,
 	return true;
 }
 
-void IntersectMeshObject(Ray ray, inout RayHit bestHit, MeshObject meshObject)
+void IntersectMeshObject(Ray ray, inout int inoutRayCount, inout RayHit bestHit, MeshObject meshObject)
 {
 	uint offset = meshObject.indices_offset;
 	uint count = offset + meshObject.indices_count;
+
+	++inoutRayCount;
+
 	for (uint i = offset; i < count; i += 3)
 	{
 		float3 v0 = (mul(meshObject.localToWorldMatrix, float4(_Vertices[_Indices[i]], 1))).xyz;
@@ -246,10 +256,12 @@ void IntersectMeshObject(Ray ray, inout RayHit bestHit, MeshObject meshObject)
 //-------------------------------------
 //- TRACE
 
-RayHit Trace(Ray ray)
+RayHit Trace(Ray ray, inout int inoutRayCount)
 {
 	RayHit bestHit = CreateRayHit();
 	uint count, stride, i;
+
+	++inoutRayCount;
 
 	// Trace ground plane
 	IntersectGroundPlane(ray, bestHit);
@@ -258,14 +270,14 @@ RayHit Trace(Ray ray)
 	_Spheres.GetDimensions(count, stride);
 	for (i = 0; i < count; i++)
 	{
-		IntersectSphere(ray, bestHit, _Spheres[i]);
+		IntersectSphere(ray, inoutRayCount, bestHit, _Spheres[i]);
 	}
 
 	// Trace mesh objects
 	_MeshObjects.GetDimensions(count, stride);
 	for (i = 0; i < count; i++)
 	{
-		IntersectMeshObject(ray, bestHit, _MeshObjects[i]);
+		IntersectMeshObject(ray, inoutRayCount, bestHit, _MeshObjects[i]);
 	}
 
 	return bestHit;
@@ -359,8 +371,8 @@ float3 Shade(inout Ray ray, RayHit hit)
 //-------------------------------------
 //- KERNEL
 
-[numthreads(8,8,1)]
-void CSMain (uint3 id : SV_DispatchThreadID)
+[numthreads(kCSGroupSizeX, kCSGroupSizeY, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupThreadID)
 {
     _Pixel = id.xy;
 
@@ -375,10 +387,11 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     Ray ray = CreateCameraRay(uv);
 
     // Trace and shade the ray
+	int rayCount = 0;
     float3 result = float3(0, 0, 0);
     for (int i = 0; i < 8; i++)
     {
-        RayHit hit = Trace(ray);
+        RayHit hit = Trace(ray, rayCount);
         result += ray.energy * Shade(ray, hit);
 
         if (!any(ray.energy))
@@ -386,4 +399,6 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     }
 
     Result[id.xy] = float4(result, 1);
+
+	g_OutRayCount.InterlockedAdd(0, rayCount);
 }
