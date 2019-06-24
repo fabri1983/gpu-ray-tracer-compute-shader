@@ -1,6 +1,7 @@
 ﻿using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.InteropServices;
 using UnityEngine;
 
 public class RayTracingMaster : MonoBehaviour
@@ -25,6 +26,7 @@ public class RayTracingMaster : MonoBehaviour
     private ComputeBuffer _sphereBuffer;
     private List<Transform> _transformsToWatch = new List<Transform>();
     private static bool _meshObjectsNeedRebuilding = false;
+    private static bool _setStaticBuffers = false;
     private static List<RayTracingObject> _rayTracingObjects = new List<RayTracingObject>();
     private static List<MeshObject> _meshObjects = new List<MeshObject>();
     private static List<Vector3> _vertices = new List<Vector3>();
@@ -33,11 +35,13 @@ public class RayTracingMaster : MonoBehaviour
     private ComputeBuffer _vertexBuffer;
     private ComputeBuffer _indexBuffer;
 
+    private ComputeBuffer _rayCountBuffer;
     private Stopwatch m_Stopwatch = new Stopwatch();
     private int m_UpdateCounter;
     private int m_FrameCounter;
     private long m_RayCounter;
 
+    [StructLayout(LayoutKind.Sequential)]
     struct MeshObject
     {
         public Matrix4x4 localToWorldMatrix;
@@ -45,6 +49,7 @@ public class RayTracingMaster : MonoBehaviour
         public int indices_count;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
     struct Sphere
     {
         public Vector3 position;
@@ -58,7 +63,6 @@ public class RayTracingMaster : MonoBehaviour
     private void Awake()
     {
         _camera = GetComponent<Camera>();
-
         _transformsToWatch.Add(transform);
         _transformsToWatch.Add(DirectionalLight.transform);
     }
@@ -75,6 +79,7 @@ public class RayTracingMaster : MonoBehaviour
         _meshObjectBuffer?.Release();
         _vertexBuffer?.Release();
         _indexBuffer?.Release();
+        _rayCountBuffer?.Release();
     }
 
     private void Update()
@@ -116,15 +121,20 @@ public class RayTracingMaster : MonoBehaviour
     {
         _rayTracingObjects.Add(obj);
         _meshObjectsNeedRebuilding = true;
+        _setStaticBuffers = true;
     }
+
     public static void UnregisterObject(RayTracingObject obj)
     {
         _rayTracingObjects.Remove(obj);
         _meshObjectsNeedRebuilding = true;
+        _setStaticBuffers = true;
     }
 
     private void SetUpScene()
     {
+        _setStaticBuffers = true;
+
         Random.InitState(SphereSeed);
         List<Sphere> spheres = new List<Sphere>();
 
@@ -177,6 +187,9 @@ public class RayTracingMaster : MonoBehaviour
             _sphereBuffer = new ComputeBuffer(spheres.Count, 56);
             _sphereBuffer.SetData(spheres);
         }
+
+        // Create counter buffer
+        _rayCountBuffer = new ComputeBuffer(1, sizeof(int));
     }
 
     private void RebuildMeshObjectBuffers()
@@ -261,19 +274,32 @@ public class RayTracingMaster : MonoBehaviour
 
     private void SetShaderParameters()
     {
-        RayTracingShader.SetTexture(0, "_SkyboxTexture", SkyboxTexture);
+        if (_setStaticBuffers)
+        {
+            RayTracingShader.SetTexture(0, "_SkyboxTexture", SkyboxTexture);
+
+            SetComputeBuffer("_Spheres", _sphereBuffer);
+            SetComputeBuffer("_MeshObjects", _meshObjectBuffer);
+            SetComputeBuffer("_Vertices", _vertexBuffer);
+            SetComputeBuffer("_Indices", _indexBuffer);
+
+            _setStaticBuffers = false;
+        }
+
         RayTracingShader.SetMatrix("_CameraToWorld", _camera.cameraToWorldMatrix);
         RayTracingShader.SetMatrix("_CameraInverseProjection", _camera.projectionMatrix.inverse);
-        RayTracingShader.SetVector("_PixelOffset", new Vector2(Random.value, Random.value));
-        RayTracingShader.SetFloat("_Seed", Random.value);
 
         Vector3 l = DirectionalLight.transform.forward;
         RayTracingShader.SetVector("_DirectionalLight", new Vector4(l.x, l.y, l.z, DirectionalLight.intensity));
 
-        SetComputeBuffer("_Spheres", _sphereBuffer);
-        SetComputeBuffer("_MeshObjects", _meshObjectBuffer);
-        SetComputeBuffer("_Vertices", _vertexBuffer);
-        SetComputeBuffer("_Indices", _indexBuffer);
+        RayTracingShader.SetVector("_PixelOffset", new Vector2(Random.value, Random.value));
+        RayTracingShader.SetFloat("_Seed", Random.value);
+    }
+
+    private void ResetRayCounter()
+    {
+        _rayCountBuffer.SetData(new int[1] { 0 });
+        SetComputeBuffer("g_OutRayCount", _rayCountBuffer);
     }
 
     private void InitRenderTexture()
@@ -306,12 +332,9 @@ public class RayTracingMaster : MonoBehaviour
     {
         // Make sure we have a current render target
         InitRenderTexture();
-
-        var rayCountBuffer = new ComputeBuffer(1, sizeof(int));
         
         // Set the target and dispatch the compute shader
         RayTracingShader.SetTexture(0, "Result", _target);
-        RayTracingShader.SetBuffer(0, "g_OutRayCount", rayCountBuffer);
         int threadGroupsX = Mathf.CeilToInt(Screen.width / 8.0f);
         int threadGroupsY = Mathf.CeilToInt(Screen.height / 8.0f);
         m_FrameCounter++;
@@ -326,18 +349,20 @@ public class RayTracingMaster : MonoBehaviour
         _currentSample++;
 
         var result = new int[1];
-        rayCountBuffer.GetData(result);
+        _rayCountBuffer.GetData(result);
         outRayCount = result[0];
-        rayCountBuffer.Release();
     }
 
     private void OnRenderImage(RenderTexture source, RenderTexture destination)
     {
         m_Stopwatch.Start();
-        int rayCount = 0;
 
         RebuildMeshObjectBuffers();
         SetShaderParameters();
+
+        ResetRayCounter();
+        int rayCount = 0;
+
         Render(destination, out rayCount);
 
         m_Stopwatch.Stop();
